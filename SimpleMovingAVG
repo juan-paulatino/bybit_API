@@ -1,0 +1,110 @@
+from pybit.unified_trading import WebSocket
+from time import sleep
+from collections import deque
+import logging # Optional: for better error logging
+
+# --- Configuration ---
+TESTNET = True
+CHANNEL_TYPE = "spot"
+SYMBOL = "BTCUSDT"
+SMA_WINDOW = 10  # Calculate SMA over the last 10 prices
+
+# --- Global State ---
+# Use deque for efficient fixed-size storage
+prices = deque(maxlen=SMA_WINDOW)
+ws = None # Initialize WebSocket object reference
+
+# --- Logging Setup (Optional but Recommended) ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- SMA Calculation ---
+def calculate_sma(data_points):
+    """Calculates the Simple Moving Average."""
+    if not data_points:
+        return None # Or return 0, depending on desired behavior for no data
+    # Ensure all items are floats before summing
+    valid_points = [p for p in data_points if isinstance(p, (int, float))]
+    if not valid_points:
+        return None
+    return sum(valid_points) / len(valid_points)
+
+# --- WebSocket Message Handler ---
+def handle_message(message):
+    """Processes incoming WebSocket messages."""
+    global prices # Indicate we are modifying the global prices deque
+
+    try:
+        # Check if it's the ticker data we subscribed to
+        if message.get("topic") == f"tickers.{SYMBOL}":
+            # Check if it's a snapshot or delta update containing data
+            if message.get("type") in ["snapshot", "delta"] and "data" in message:
+                data = message["data"]
+                # Safely get the usdIndexPrice
+                usd_index_price_str = data.get("usdIndexPrice")
+
+                # Check if the price exists and is not empty
+                if usd_index_price_str is not None and usd_index_price_str != '':
+                    try:
+                        # Convert price to float
+                        current_price = float(usd_index_price_str)
+                        logging.info(f"Real-time {SYMBOL} usdIndexPrice: {current_price:.2f}")
+
+                        # Add price to our deque (automatically handles maxlen)
+                        prices.append(current_price)
+
+                        # Calculate SMA if we have enough data points
+                        if len(prices) == SMA_WINDOW:
+                            sma = calculate_sma(prices)
+                            if sma is not None:
+                                logging.info(f"SMA ({SMA_WINDOW} periods): {sma:.2f}\n")
+                        else:
+                            logging.info(f"Collecting data... ({len(prices)}/{SMA_WINDOW} points for SMA)\n")
+
+                    except ValueError:
+                        logging.warning(f"Could not convert usdIndexPrice '{usd_index_price_str}' to float.")
+                    except Exception as e:
+                         logging.error(f"Error processing price data: {e}")
+                # else:
+                #     # Optional: Log if usdIndexPrice is missing or empty in a relevant message
+                #     logging.debug(f"usdIndexPrice missing or empty in message: {message}")
+
+        # Optional: Log other message types if needed for debugging
+        # else:
+        #     logging.debug(f"Received other message: {message}")
+
+    except Exception as e:
+        logging.error(f"Error in handle_message: {e}")
+        logging.error(f"Problematic message: {message}")
+
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    logging.info(f"Connecting to Bybit {CHANNEL_TYPE} WebSocket ({'Testnet' if TESTNET else 'Mainnet'})...")
+    logging.info(f"Subscribing to {SYMBOL} tickers and calculating {SMA_WINDOW}-period SMA on usdIndexPrice.")
+
+    ws = WebSocket(
+        testnet=TESTNET,
+        channel_type=CHANNEL_TYPE,
+    )
+
+    # Subscribe to the ticker stream for the specified symbol
+    ws.ticker_stream(
+        symbol=SYMBOL,
+        callback=handle_message
+    )
+
+    # Keep the script running to receive messages
+    while True:
+        try:
+            sleep(1)
+        except KeyboardInterrupt:
+            logging.info("Script interrupted by user. Exiting.")
+            if ws:
+                 # Attempt to gracefully close the WebSocket connection if possible
+                 # Note: pybit's WebSocket might not have an explicit close method exposed easily here.
+                 # The background thread should terminate when the main script exits.
+                 pass
+            break
+        except Exception as e:
+            logging.error(f"Error in main loop: {e}")
+            sleep(5) # Wait a bit before retrying loop
