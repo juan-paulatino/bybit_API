@@ -1,0 +1,144 @@
+# --- Imports ---
+from pybit.unified_trading import WebSocket
+from time import sleep
+from collections import deque
+import logging
+import numpy as np # Import numpy for calculations
+
+# --- Configuration ---
+TESTNET = False
+CHANNEL_TYPE = "spot"
+SYMBOL = "BTCUSDT"
+WINDOW_SIZE = 1250 # Calculate WLR over the last N prices (Renamed from SMA_WINDOW)
+
+# --- Global State ---
+# Use deque for efficient fixed-size storage
+prices = deque(maxlen=WINDOW_SIZE)
+ws = None # Initialize WebSocket object reference
+
+# --- Logging Setup (Optional but Recommended) ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- Weighted Linear Regression Slope Calculation ---
+def calculate_wlr_slope(data_points):
+    """
+    Calculates the slope of a Weighted Linear Regression line.
+    Weights increase linearly, giving more weight to recent data.
+    """
+    n = len(data_points)
+    if n < 2: # Need at least two points to calculate a slope
+        return None
+
+    try:
+        # Convert deque to numpy array for vectorized operations
+        y = np.array(data_points, dtype=float)
+        # Create time indices (1, 2, ..., n)
+        x = np.arange(1, n + 1)
+        # Create linear weights (1, 2, ..., n)
+        w = np.arange(1, n + 1)
+
+        # Calculate weighted means
+        sum_w = np.sum(w)
+        x_w_mean = np.sum(w * x) / sum_w
+        y_w_mean = np.sum(w * y) / sum_w
+
+        # Calculate the slope (b) of the WLR line y = a + bx
+        numerator = np.sum(w * (x - x_w_mean) * (y - y_w_mean))
+        denominator = np.sum(w * (x - x_w_mean)**2)
+
+        if denominator == 0:
+            # This should theoretically not happen with linearly increasing x and w > 0
+            logging.warning("WLR slope calculation resulted in division by zero.")
+            return None
+
+        slope = numerator / denominator
+        return slope
+
+    except Exception as e:
+        logging.error(f"Error during WLR calculation: {e}")
+        return None
+
+
+# --- WebSocket Message Handler ---
+def handle_message(message):
+    """Processes incoming WebSocket messages."""
+    global prices # Indicate we are modifying the global prices deque
+
+    try:
+        # Check if it's the ticker data we subscribed to
+        if message.get("topic") == f"tickers.{SYMBOL}":
+            # Check if it's a snapshot or delta update containing data
+            if message.get("type") in ["snapshot", "delta"] and "data" in message:
+                data = message["data"]
+                # Safely get the usdIndexPrice
+                usd_index_price_str = data.get("usdIndexPrice")
+
+                # Check if the price exists and is not empty
+                if usd_index_price_str is not None and usd_index_price_str != '':
+                    try:
+                        # Convert price to float
+                        current_price = float(usd_index_price_str)
+                        logging.info(f"Real-time {SYMBOL} usdIndexPrice: {current_price:.2f}")
+
+                        # Add price to our deque (automatically handles maxlen)
+                        prices.append(current_price)
+
+                        # Calculate WLR slope if we have enough data points
+                        if len(prices) == WINDOW_SIZE:
+                            wlr_slope = calculate_wlr_slope(prices) # Use the new function
+                            if wlr_slope is not None:
+                                # Log the WLR slope - adjust formatting as needed
+                                logging.info(f"WLR Slope ({WINDOW_SIZE} periods): {wlr_slope:.8f}\n")
+                        else:
+                            logging.info(f"Collecting data... ({len(prices)}/{WINDOW_SIZE} points for WLR)\n")
+
+                    except ValueError:
+                        logging.warning(f"Could not convert usdIndexPrice '{usd_index_price_str}' to float.")
+                    except Exception as e:
+                         logging.error(f"Error processing price data: {e}")
+                # else:
+                #     # Optional: Log if usdIndexPrice is missing or empty in a relevant message
+                #     logging.debug(f"usdIndexPrice missing or empty in message: {message}")
+
+        # Optional: Log other message types if needed for debugging
+        # else:
+        #     logging.debug(f"Received other message: {message}")
+
+    except Exception as e:
+        logging.error(f"Error in handle_message: {e}")
+        logging.error(f"Problematic message: {message}")
+
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    logging.info(f"Connecting to Bybit {CHANNEL_TYPE} WebSocket ({'Testnet' if TESTNET else 'Mainnet'})...")
+    # Updated logging message
+    logging.info(f"Subscribing to {SYMBOL} tickers and calculating {WINDOW_SIZE}-period Weighted Linear Regression Slope on usdIndexPrice.")
+
+    ws = WebSocket(
+        testnet=TESTNET,
+        channel_type=CHANNEL_TYPE,
+    )
+
+    # Subscribe to the ticker stream for the specified symbol
+    ws.ticker_stream(
+        symbol=SYMBOL,
+        callback=handle_message
+    )
+
+    # Keep the script running to receive messages
+    while True:
+        try:
+            sleep(1)
+        except KeyboardInterrupt:
+            logging.info("Script interrupted by user. Exiting.")
+            if ws:
+                 # Attempt to gracefully close the WebSocket connection if possible
+                 # Note: pybit's WebSocket might not have an explicit close method exposed easily here.
+                 # The background thread should terminate when the main script exits.
+                 pass
+            break
+        except Exception as e:
+            logging.error(f"Error in main loop: {e}")
+            sleep(5) # Wait a bit before retrying loop
+
